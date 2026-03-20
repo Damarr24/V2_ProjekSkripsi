@@ -1,0 +1,519 @@
+// ============================================================
+// BACKEND – Kesbangpol Kudus | Versi Publik (tanpa admin)
+// Google Apps Script — paste ke editor GAS lalu deploy as Web App
+// ============================================================
+
+// ===== KONFIGURASI — GANTI SESUAI MILIKMU =====
+const SPREADSHEET_ID  = "1OlFkApexmr_L2UovRW-J_d2GiCxMT9pu6C0a4NyEaNc";
+const DRIVE_FOLDER_ID = "1_NwjDDcXDA6LZ8DsEBO16WU0BH3dBKK7"; // folder REGISTRASI
+const SHEET_NAME      = "Data";                // nama sheet tab
+const TEMPLATE_ID     = "1Q3hlI1prise-DRQLj-TXxvFlD-MZR_5nlxIDRpZGXuQ"; // template surat
+const HASIL_FOLDER_ID = "1Kp4eWCY9S4akGE17ToiKQriq2guYP4za"; // folder HASIL REGISTRASI
+
+// ============================================================
+// doPost — menerima submission form pendaftaran
+// ============================================================
+function doPost(e) {
+  try {
+    var fileContent = e.parameter.fileContent;
+    var filename    = e.parameter.filename;
+    var email       = e.parameter.email;
+    var nama        = e.parameter.nama;
+
+    // Generate nomor referensi unik
+    var refNum = "KBP-" + Utilities.formatDate(
+      new Date(), Session.getScriptTimeZone(), "yyyyMMdd-HHmm"
+    );
+
+    // Upload file ke Google Drive
+    var fileUrl = uploadFileToDrive(fileContent, filename);
+
+    // Catat data ke Spreadsheet
+    recordData(e, fileUrl, refNum);
+
+    // Auto generate surat dari template → simpan di Drive → link ke Sheets
+    generateSurat(e, refNum);
+
+    // Kirim email konfirmasi ke pemohon
+    kirimEmailKonfirmasi(e, refNum);
+
+    return jsonResponse({ success: true, ref: refNum });
+
+  } catch (err) {
+    Logger.log("doPost error: " + err);
+    return jsonResponse({ success: false, error: err.toString() });
+  }
+}
+
+// ============================================================
+// doGet — endpoint cek status oleh pemohon
+// ============================================================
+function doGet(e) {
+  const action = e.parameter.action;
+
+  if (action === "checkStatus") {
+    return handleCheckStatus(e);
+  }
+
+  return jsonResponse({ error: "Action tidak dikenal" });
+}
+
+// ============================================================
+// Upload file ke Google Drive
+// ============================================================
+function uploadFileToDrive(data, filename) {
+  try {
+    var folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+
+    var bytes = Utilities.base64Decode(data.split(',')[1]);
+    var mime  = data.substring(5, data.indexOf(';'));
+    var blob  = Utilities.newBlob(bytes, mime, filename);
+    var file  = folder.createFile(blob);
+
+    return file.getUrl();
+  } catch (err) {
+    Logger.log("uploadFileToDrive error: " + err);
+    return "";
+  }
+}
+
+// ============================================================
+// Simpan data ke Google Sheets
+// ============================================================
+function recordData(e, fileUrl, refNum) {
+  try {
+    var ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+    var sheet = ss.getSheetByName(SHEET_NAME);
+
+    // Ambil header dari baris pertama
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn())
+                       .getValues()[0];
+
+    var timestamp = Utilities.formatDate(
+      new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"
+    );
+
+    var row = headers.map(function(h) {
+      h = h.toString().toLowerCase().trim();
+      if (h === "timestamp")  return timestamp;
+      if (h === "file")       return fileUrl;
+      if (h === "status")     return "Pending";
+      if (h === "ref_number") return refNum;
+      if (h === "link_surat") return "";
+      return e.parameter[h] || "";
+    });
+
+    sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length)
+         .setValues([row]);
+
+  } catch (err) {
+    Logger.log("recordData error: " + err);
+  }
+}
+
+// ============================================================
+// Cek status oleh pemohon berdasarkan nomor referensi
+// ============================================================
+function handleCheckStatus(e) {
+  try {
+    const ref = (e.parameter.ref || "").trim().toUpperCase();
+    if (!ref) return jsonResponse({ found: false });
+
+    const ss      = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const sheet   = ss.getSheetByName(SHEET_NAME);
+    const data    = sheet.getDataRange().getValues();
+
+    if (data.length < 2) return jsonResponse({ found: false });
+
+    const headers = data[0].map(h => h.toString().toLowerCase().trim());
+    const colRef  = headers.indexOf("ref_number");
+
+    if (colRef === -1) {
+      return jsonResponse({ found: false, error: "Kolom ref_number tidak ditemukan di sheet" });
+    }
+
+    for (let i = 1; i < data.length; i++) {
+      const rowRef = (data[i][colRef] || "").toString().trim().toUpperCase();
+      if (rowRef === ref) {
+        const row = {};
+        headers.forEach((h, idx) => {
+          row[h] = data[i][idx] ? data[i][idx].toString() : "";
+        });
+        return jsonResponse({ found: true, row });
+      }
+    }
+
+    return jsonResponse({ found: false });
+
+  } catch (err) {
+    return jsonResponse({ found: false, error: err.toString() });
+  }
+}
+
+// ============================================================
+// Auto generate surat dari template Google Docs
+// ============================================================
+function generateSurat(e, refNum) {
+  try {
+    // Ambil data dari parameter form
+    const nama            = e.parameter.nama            || "";
+    const atasnama        = e.parameter.atasnama        || "";
+    const fakultas        = e.parameter.fakultas        || "";
+    const nama_lembaga    = e.parameter.nama_lembaga    || "";
+    const nomor_surat     = e.parameter.nomor_surat     || "";
+    const perihal         = e.parameter.perihal         || "";
+    const alamat          = e.parameter.alamat          || "";
+    const rt              = e.parameter.rukun_tetangga_rt || "";
+    const rw              = e.parameter.rukun_warga_rw  || "";
+    const kecamatan       = e.parameter.kecamatan       || "";
+    const kabupaten       = e.parameter.kabupaten       || "";
+    const pekerjaan       = e.parameter.pekerjaan       || "";
+    const email           = e.parameter.email           || "";
+    const nomor_hp        = e.parameter.nomor_hp        || "";
+    const proposal        = e.parameter.proposal        || "";
+    const lokasi          = e.parameter.lokasi          || "";
+    const bidang          = e.parameter.bidang          || "";
+    const tanggal_mulai   = e.parameter.tanggal_mulai   || "";
+    const tanggal_selesai = e.parameter.tanggal_selesai || "";
+    const penanggung_jawab= e.parameter.penanggung_jawab|| "";
+    const anggota         = e.parameter.anggota_peneliti|| "";
+    const tgl_surat       = e.parameter.tgl_surat       || "";
+
+    // Salin template ke folder HASIL REGISTRASI
+    const hasilFolder = DriveApp.getFolderById(HASIL_FOLDER_ID);
+    const copy = DriveApp.getFileById(TEMPLATE_ID).makeCopy(
+      `Surat Penelitian - ${nama} [${refNum}]`,
+      hasilFolder
+    );
+
+    // Buka dokumen dan replace semua placeholder
+    const doc  = DocumentApp.openById(copy.getId());
+    const body = doc.getBody();
+
+    body.replaceText("{{atasnama}}",         atasnama);
+    body.replaceText("{{fakultas}}",          fakultas);
+    body.replaceText("{{nama_lembaga}}",      nama_lembaga);
+    body.replaceText("{{nomor_surat}}",       nomor_surat);
+    body.replaceText("{{tgl_surat}}",         formatTanggalIndonesia(tgl_surat));
+    body.replaceText("{{perihal}}",           perihal);
+    body.replaceText("{{nama}}",              nama);
+    body.replaceText("{{alamat}}",            alamat);
+    body.replaceText("{{rukun_tetangga_rt}}", rt);
+    body.replaceText("{{rukun_warga_rw}}",    rw);
+    body.replaceText("{{kecamatan}}",         kecamatan);
+    body.replaceText("{{kabupaten}}",         kabupaten);
+    body.replaceText("{{pekerjaan}}",         pekerjaan);
+    body.replaceText("{{email}}",             email);
+    body.replaceText("{{nomor_hp}}",          nomor_hp);
+    body.replaceText("{{proposal}}",          proposal);
+    body.replaceText("{{lokasi}}",            lokasi);
+    body.replaceText("{{bidang}}",            bidang);
+    body.replaceText("{{tanggal_mulai}}",     formatTanggalIndonesia(tanggal_mulai));
+    body.replaceText("{{tanggal_selesai}}",   formatTanggalIndonesia(tanggal_selesai));
+    body.replaceText("{{penanggung_jawab}}",  penanggung_jawab);
+    body.replaceText("{{anggota_peneliti}}",  anggota);
+    body.replaceText("{{ref_number}}",        refNum);
+
+    doc.saveAndClose();
+
+    // Simpan link surat ke kolom link_surat di Sheets
+    const ss      = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const sheet   = ss.getSheetByName(SHEET_NAME);
+    const data    = sheet.getDataRange().getValues();
+    const headers = data[0].map(h => h.toString().toLowerCase().trim());
+    const colRef  = headers.indexOf("ref_number") + 1;
+    const colLink = headers.indexOf("link_surat") + 1;
+
+    if (colRef && colLink) {
+      for (let i = 1; i < data.length; i++) {
+        if ((data[i][colRef - 1] || "").toString().trim() === refNum) {
+          sheet.getRange(i + 1, colLink).setValue(copy.getUrl());
+
+          // Auto update status → Diproses
+          const colStatus = headers.indexOf("status") + 1;
+          if (colStatus) {
+            sheet.getRange(i + 1, colStatus).setValue("Diproses");
+          }
+
+          break;
+        }
+      }
+    }
+
+    Logger.log("Surat berhasil dibuat: " + copy.getUrl());
+    return copy.getUrl();
+
+  } catch (err) {
+    Logger.log("generateSurat error: " + err);
+    return null;
+  }
+}
+
+// ============================================================
+// Kirim email konfirmasi ke pemohon
+// ============================================================
+function formatTanggalIndonesia(dateStr) {
+  if (!dateStr) return "-";
+  const bulan = [
+    "Januari","Februari","Maret","April","Mei","Juni",
+    "Juli","Agustus","September","Oktober","November","Desember"
+  ];
+  const d = new Date(dateStr);
+  if (isNaN(d)) return dateStr;
+  return `${d.getDate()} ${bulan[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+function kirimEmailKonfirmasi(e, refNum) {
+  try {
+    const emailPemohon = e.parameter.email;
+    if (!emailPemohon) return;
+
+    const nama       = e.parameter.nama            || "-";
+    const proposal   = e.parameter.proposal        || "-";
+    const tglMulai   = formatTanggalIndonesia(e.parameter.tanggal_mulai);
+    const tglSelesai = formatTanggalIndonesia(e.parameter.tanggal_selesai);
+    const lokasi     = e.parameter.lokasi          || "-";
+    const nomor_hp   = e.parameter.nomor_hp        || "-";
+    const lembaga    = e.parameter.nama_lembaga    || "-";
+
+    const subject = `✅ Registrasi Penelitian Diterima – Kesbangpol Kudus [${refNum}]`;
+
+    const htmlBody = `
+    <!DOCTYPE html>
+    <html lang="id">
+    <body style="margin:0;padding:0;background:#eef2f7;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#eef2f7;padding:32px 16px;">
+      <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+
+        <!-- HEADER -->
+        <tr><td style="background:linear-gradient(135deg,#0d1f35,#1a3a5c);border-radius:16px 16px 0 0;padding:36px 32px;text-align:center;">
+          <p style="margin:0 0 4px;font-family:Arial,sans-serif;font-size:11px;color:#c8a951;letter-spacing:3px;text-transform:uppercase;">Pemerintah Kabupaten Kudus</p>
+          <h1 style="margin:0 0 4px;font-family:Arial,sans-serif;font-size:20px;font-weight:800;color:#ffffff;">Badan Kesatuan Bangsa dan Politik</h1>
+          <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;color:rgba(255,255,255,0.65);">Sistem Registrasi Penelitian</p>
+        </td></tr>
+
+        <!-- STATUS BANNER -->
+        <tr><td style="background:#1a9e5c;padding:14px 32px;text-align:center;">
+          <p style="margin:0;font-family:Arial,sans-serif;font-size:14px;font-weight:700;color:#ffffff;">
+            ✓ &nbsp;Pendaftaran Anda Telah Berhasil Diterima
+          </p>
+        </td></tr>
+
+        <!-- BODY -->
+        <tr><td style="background:#ffffff;padding:36px 32px;border-radius:0 0 16px 16px;">
+          <p style="margin:0 0 6px;font-family:Arial,sans-serif;font-size:15px;color:#1a2b3c;">
+            Kepada Yth. <strong>${nama}</strong>,
+          </p>
+          <p style="margin:0 0 28px;font-family:Arial,sans-serif;font-size:14px;color:#4a5568;line-height:1.8;">
+            Terima kasih telah mendaftarkan penelitian Anda melalui sistem registrasi online Kesbangpol Kabupaten Kudus.
+            Pengajuan Anda telah <strong style="color:#1a9e5c;">berhasil kami terima</strong> dan saat ini sedang dalam antrian proses verifikasi.
+          </p>
+
+          <!-- RINGKASAN DATA -->
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f9ff;border:1px solid #d6e4f7;border-left:4px solid #2558a3;border-radius:10px;margin-bottom:28px;">
+            <tr><td style="padding:20px 20px 12px;">
+              <p style="margin:0 0 14px;font-family:Arial,sans-serif;font-size:11px;font-weight:700;color:#2558a3;letter-spacing:1.5px;text-transform:uppercase;">Ringkasan Pengajuan</p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="font-family:Arial,sans-serif;font-size:13.5px;color:#1a2b3c;">
+                <tr>
+                  <td style="padding:7px 0;color:#6b7a8d;width:42%;vertical-align:top;">Nomor Referensi</td>
+                  <td style="padding:7px 0;vertical-align:top;"><strong style="color:#2558a3;">${refNum}</strong></td>
+                </tr>
+                <tr style="border-top:1px solid #e4edf8;">
+                  <td style="padding:7px 0;color:#6b7a8d;vertical-align:top;">Nama Pemohon</td>
+                  <td style="padding:7px 0;vertical-align:top;"><strong>${nama}</strong></td>
+                </tr>
+                <tr style="border-top:1px solid #e4edf8;">
+                  <td style="padding:7px 0;color:#6b7a8d;vertical-align:top;">Asal Lembaga</td>
+                  <td style="padding:7px 0;vertical-align:top;"><strong>${lembaga}</strong></td>
+                </tr>
+                <tr style="border-top:1px solid #e4edf8;">
+                  <td style="padding:7px 0;color:#6b7a8d;vertical-align:top;">Judul Penelitian</td>
+                  <td style="padding:7px 0;vertical-align:top;"><strong>${proposal}</strong></td>
+                </tr>
+                <tr style="border-top:1px solid #e4edf8;">
+                  <td style="padding:7px 0;color:#6b7a8d;vertical-align:top;">Lokasi / OPD</td>
+                  <td style="padding:7px 0;vertical-align:top;"><strong>${lokasi}</strong></td>
+                </tr>
+                <tr style="border-top:1px solid #e4edf8;">
+                  <td style="padding:7px 0;color:#6b7a8d;vertical-align:top;">Periode Penelitian</td>
+                  <td style="padding:7px 0;vertical-align:top;"><strong>${tglMulai} s/d ${tglSelesai}</strong></td>
+                </tr>
+                <tr style="border-top:1px solid #e4edf8;">
+                  <td style="padding:7px 0;color:#6b7a8d;vertical-align:top;">Nomor HP</td>
+                  <td style="padding:7px 0;vertical-align:top;"><strong>${nomor_hp}</strong></td>
+                </tr>
+              </table>
+            </td></tr>
+          </table>
+
+          <!-- PROGRESS STEPS -->
+          <p style="margin:0 0 14px;font-family:Arial,sans-serif;font-size:11px;font-weight:700;color:#1a2b3c;letter-spacing:1.5px;text-transform:uppercase;">Tahapan Proses</p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+            <tr>
+              <td align="center" width="33%" style="vertical-align:top;padding:0 6px;">
+                <div style="width:40px;height:40px;background:#1a9e5c;border-radius:50%;margin:0 auto 8px;display:table;text-align:center;vertical-align:middle;">
+                  <span style="display:table-cell;vertical-align:middle;font-family:Arial,sans-serif;font-size:20px;font-weight:700;color:#fff;">✓</span>
+                </div>
+                <p style="margin:0;font-family:Arial,sans-serif;font-size:12px;font-weight:700;color:#1a9e5c;">Pendaftaran</p>
+                <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;color:#6b7a8d;">Selesai</p>
+              </td>
+              <td align="center" style="vertical-align:middle;padding-bottom:26px;font-size:22px;font-weight:700;color:#1a9e5c;">&rarr;</td>
+              <td align="center" width="33%" style="vertical-align:top;padding:0 6px;">
+                <div style="width:40px;height:40px;background:#f59e0b;border-radius:50%;margin:0 auto 8px;display:table;text-align:center;vertical-align:middle;">
+                  <span style="display:table-cell;vertical-align:middle;font-family:Arial,sans-serif;font-size:14px;font-weight:700;color:#fff;">⏳</span>
+                </div>
+                <p style="margin:0;font-family:Arial,sans-serif;font-size:12px;font-weight:700;color:#f59e0b;">Verifikasi</p>
+                <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;color:#6b7a8d;">Sedang diproses</p>
+              </td>
+              <td align="center" style="vertical-align:middle;padding-bottom:26px;font-size:22px;font-weight:700;color:#d1d5db;">&rarr;</td>
+              <td align="center" width="33%" style="vertical-align:top;padding:0 6px;">
+                <div style="width:40px;height:40px;background:#e5e7eb;border-radius:50%;margin:0 auto 8px;display:table;text-align:center;vertical-align:middle;">
+                  <span style="display:table-cell;vertical-align:middle;font-family:Arial,sans-serif;font-size:16px;font-weight:700;color:#9ca3af;">&#128209;</span>
+                </div>
+                <p style="margin:0;font-family:Arial,sans-serif;font-size:12px;font-weight:700;color:#9ca3af;">Surat Siap</p>
+                <p style="margin:2px 0 0;font-family:Arial,sans-serif;font-size:11px;color:#9ca3af;">Menunggu</p>
+              </td>
+            </tr>
+          </table>
+
+          <!-- INFO BOX -->
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#fffbea;border:1px solid #f0d070;border-radius:10px;margin-bottom:24px;">
+            <tr><td style="padding:16px 18px;">
+              <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;color:#7c5e00;line-height:1.8;">
+                <strong>ⓘ</strong><br>
+                Surat rekomendasi akan dikirimkan ke email ini setelah selesai diverifikasi.
+                Harap pastikan email ini tetap aktif dan periksa folder <em>Spam</em> jika tidak menerima balasan dalam beberapa hari kerja.
+                Gunakan nomor referensi <strong>${refNum}</strong> untuk mengecek status pengajuan Anda.
+              </p>
+            </td></tr>
+          </table>
+
+          <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;color:#6b7a8d;line-height:1.8;">
+            Apabila Anda memiliki pertanyaan, silakan hubungi kami melalui WhatsApp atau Instagram resmi Kesbangpol Kudus.<br><br>
+            Hormat kami,<br>
+            <strong style="color:#1a2b3c;">Badan Kesatuan Bangsa dan Politik</strong><br>
+            <span style="color:#9aa5b4;">Kabupaten Kudus</span>
+          </p>
+        </td></tr>
+
+        <!-- FOOTER -->
+        <tr><td style="padding:24px 0;text-align:center;">
+          <p style="margin:0;font-family:Arial,sans-serif;font-size:11px;color:#9aa5b4;line-height:1.8;">
+            &copy; 2025–2026 Badan Kesatuan Bangsa dan Politik Kabupaten Kudus<br>
+            Email ini dikirim secara otomatis oleh sistem. Mohon tidak membalas email ini.<br>
+            Dikembangkan oleh <strong style="color:#6b7a8d;">Dimas Wahyu Damar Panuluh</strong> – Teknik Informatika, Universitas Muria Kudus
+          </p>
+        </td></tr>
+
+      </table>
+      </td></tr>
+    </table>
+    </body></html>`;
+
+    GmailApp.sendEmail(emailPemohon, subject, "", { htmlBody });
+
+  } catch (err) {
+    Logger.log("kirimEmailKonfirmasi error: " + err);
+  }
+}
+
+// ============================================================
+// Helper
+// ============================================================
+function jsonResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================================================
+// SETUP SHEET — jalankan SEKALI manual dari GAS editor
+// Fungsi ini: buat header + dropdown status otomatis
+// Cara: buka GAS editor → pilih fungsi setupSheet → klik Run
+// ============================================================
+function setupSheet() {
+  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+  let sheet   = ss.getSheetByName(SHEET_NAME);
+
+  // Buat sheet "Data" kalau belum ada
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+  }
+
+  // Set header baris 1 kalau masih kosong
+  const headers = [
+    "timestamp", "atasnama", "fakultas", "nama_lembaga",
+    "nomor_surat", "tgl_surat", "perihal", "nama", "alamat",
+    "rukun_tetangga_rt", "rukun_warga_rw", "kecamatan", "kabupaten",
+    "pekerjaan", "proposal", "lokasi", "bidang",
+    "tanggal_mulai", "tanggal_selesai", "penanggung_jawab",
+    "anggota_peneliti", "email", "nomor_hp",
+    "file", "link_surat", "status", "ref_number"
+  ];
+
+  const firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  const isEmpty  = firstRow.every(cell => cell === "");
+  if (isEmpty) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+    // Bold + warna header
+    const headerRange = sheet.getRange(1, 1, 1, headers.length);
+    headerRange.setFontWeight("bold")
+               .setBackground("#0a2a5e")
+               .setFontColor("#ffffff")
+               .setHorizontalAlignment("center");
+
+    // Freeze baris header
+    sheet.setFrozenRows(1);
+
+    Logger.log("Header berhasil dibuat.");
+  }
+
+  // Temukan kolom "status"
+  const allHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn())
+                          .getValues()[0]
+                          .map(h => h.toString().toLowerCase().trim());
+  const colStatus  = allHeaders.indexOf("status") + 1;
+
+  if (!colStatus) {
+    Logger.log("Kolom status tidak ditemukan.");
+    return;
+  }
+
+  // Pasang dropdown validasi di kolom status (baris 2 ke bawah, 1000 baris)
+  const statusRange = sheet.getRange(2, colStatus, 1000, 1);
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["Pending", "Diproses", "Selesai", "Ditolak"], true)
+    .setAllowInvalid(false)
+    .setHelpText("Pilih status: Pending, Diproses, Selesai, atau Ditolak")
+    .build();
+
+  statusRange.setDataValidation(rule);
+
+  // Kasih warna kondisional per status (conditional formatting)
+  const rules = sheet.getConditionalFormatRules();
+
+  const colorMap = [
+    { val: "Pending",   bg: "#fef3c7", font: "#92400e" },
+    { val: "Diproses",  bg: "#dbeafe", font: "#1e40af" },
+    { val: "Selesai",   bg: "#d1fae5", font: "#065f46" },
+    { val: "Ditolak",   bg: "#fee2e2", font: "#991b1b" },
+  ];
+
+  colorMap.forEach(({ val, bg, font }) => {
+    const newRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo(val)
+      .setBackground(bg)
+      .setFontColor(font)
+      .setBold(true)
+      .setRanges([statusRange])
+      .build();
+    rules.push(newRule);
+  });
+
+  sheet.setConditionalFormatRules(rules);
+
+  Logger.log("✅ Setup selesai! Dropdown + warna status sudah terpasang.");
+  SpreadsheetApp.getUi().alert("✅ Setup berhasil!\n\nDropdown dan warna status sudah terpasang di kolom status.");
+}
